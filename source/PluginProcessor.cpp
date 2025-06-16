@@ -1,17 +1,17 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "ProtectYourEars.h"
 
 //==============================================================================
 PluginProcessor::PluginProcessor()
-     : AudioProcessor (BusesProperties()
-                     #if ! JucePlugin_IsMidiEffect
-                      #if ! JucePlugin_IsSynth
-                       .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
-                      #endif
-                       .withOutput ("Output", juce::AudioChannelSet::stereo(), true)
-                     #endif
-                       )
+     : AudioProcessor (
+         BusesProperties()
+            .withInput("Input", juce::AudioChannelSet::stereo(), true)
+            .withOutput ("Output", juce::AudioChannelSet::stereo(), true)
+        ), params(apvts)
 {
+    lowCutFilter.setType (juce::dsp::StateVariableTPTFilterType::highpass);
+    highCutFilter.setType (juce::dsp::StateVariableTPTFilterType::lowpass);
 }
 
 PluginProcessor::~PluginProcessor()
@@ -89,6 +89,31 @@ void PluginProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     // Use this method as the place to do any pre-playback
     // initialisation that you need..
     juce::ignoreUnused (sampleRate, samplesPerBlock);
+    params.prepareToPlay (sampleRate);
+    params.reset();
+    feedbackL = 0.0f;
+    feedbackR = 0.0f;
+    lastLowCut = -1.0f;
+    lastHighCut = -1.0f;
+
+    juce::dsp::ProcessSpec spec;
+    spec.sampleRate = sampleRate;
+    spec.maximumBlockSize = juce::uint32(samplesPerBlock);
+    spec.numChannels = 2;
+    double numSamples = Parameters::maxDelayTime/1000.0 * sampleRate;
+    int maxDelayInSamples = int(std::ceil(numSamples));
+    delayLineL.setMaximumDelayInSamples(maxDelayInSamples);
+    delayLineR.setMaximumDelayInSamples(maxDelayInSamples);
+    delayLineL.reset();
+    delayLineR.reset();
+    lowCutFilter.prepare(spec);
+    lowCutFilter.reset();
+    highCutFilter.prepare(spec);
+    highCutFilter.reset();
+    tempo.reset();
+    levelL.reset();
+    levelR.reset();
+    // DBG(maxDelayInSamples);
 }
 
 void PluginProcessor::releaseResources()
@@ -99,27 +124,18 @@ void PluginProcessor::releaseResources()
 
 bool PluginProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
-  #if JucePlugin_IsMidiEffect
-    juce::ignoreUnused (layouts);
-    return true;
-  #else
-    // This is the place where you check if the layout is supported.
-    // In this template code we only support mono or stereo.
-    if (layouts.getMainOutputChannelSet() != juce::AudioChannelSet::mono()
-     && layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
-        return false;
+    const auto mono = juce::AudioChannelSet::mono();
+    const auto stereo = juce::AudioChannelSet::stereo();
+    const auto mainIn = layouts.getMainInputChannelSet();
+    const auto mainOut = layouts.getMainOutputChannelSet();
 
-    // This checks if the input layout matches the output layout
-   #if ! JucePlugin_IsSynth
-    if (layouts.getMainOutputChannelSet() != layouts.getMainInputChannelSet())
-        return false;
-   #endif
-
-    return true;
-  #endif
+    if (mainIn == mono && mainOut == mono) {return true;}
+    if (mainIn == stereo && mainOut == stereo) {return true;}
+    if (mainIn == stereo && mainOut == stereo) {return true;}
+    return false;
 }
 
-void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
+void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer, [[maybe_unused]]
                                               juce::MidiBuffer& midiMessages)
 {
     juce::ignoreUnused (midiMessages);
@@ -128,27 +144,122 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     auto totalNumInputChannels  = getTotalNumInputChannels();
     auto totalNumOutputChannels = getTotalNumOutputChannels();
 
-    // In case we have more outputs than inputs, this code clears any output
-    // channels that didn't contain input data, (because these aren't
-    // guaranteed to be empty - they may contain garbage).
-    // This is here to avoid people getting screaming feedback
-    // when they first compile a plugin, but obviously you don't need to keep
-    // this code if your algorithm always overwrites all the output channels.
+    // write silence into the audio buffer
     for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
         buffer.clear (i, 0, buffer.getNumSamples());
 
-    // This is the place where you'd normally do the guts of your plugin's
-    // audio processing...
-    // Make sure to reset the state if your inner loop is processing
-    // the samples and the outer loop is handling the channels.
-    // Alternatively, you can process the samples with the channels
-    // interleaved by keeping the same state.
-    for (int channel = 0; channel < totalNumInputChannels; ++channel)
-    {
-        auto* channelData = buffer.getWritePointer (channel);
-        juce::ignoreUnused (channelData);
-        // ..do something to the data...
+    params.update();
+    tempo.update(getPlayHead());
+
+    float syncedTime = float(tempo.getMillisecondsForNoteLength (params.delayNote));
+    if (syncedTime > Parameters::maxDelayTime) {
+        syncedTime = Parameters::maxDelayTime;
     }
+
+    float sampleRate = float(getSampleRate());
+
+    auto mainInput = getBusBuffer(buffer, true, 0);
+    auto mainInputChannels = mainInput.getNumChannels();
+    auto isMainInputStereo = mainInputChannels > 1;
+    const float* inputDataL = mainInput.getReadPointer(0);
+    const float* inputDataR = mainInput.getReadPointer(isMainInputStereo ? 1 : 0);
+
+    auto mainOutput = getBusBuffer(buffer, false, 0);
+    auto mainOutputChannels = mainOutput.getNumChannels();
+    auto isMainOutputStereo = mainOutputChannels > 1;
+    float* outputDataL = mainOutput.getWritePointer(0);
+    float* outputDataR = mainOutput.getWritePointer(isMainOutputStereo ? 1 : 0);
+
+    float maxL = 0.0f;
+    float maxR = 0.0f;
+
+    if (isMainOutputStereo)
+    {
+        for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+        {
+            params.smoothen();
+
+            float delayTime = params.tempoSync ? syncedTime : params.delayTime;
+            float delayInSamples = delayTime/1000.0f * sampleRate;
+
+            if (params.lowCut != lastLowCut) {
+                lowCutFilter.setCutoffFrequency (params.lowCut);
+                lastLowCut = params.lowCut;
+            }
+            if (params.highCut != lastHighCut) {
+                highCutFilter.setCutoffFrequency (params.highCut);
+                lastHighCut = params.highCut;
+            }
+
+            float dryL = inputDataL[sample];
+            float dryR = inputDataR[sample];
+
+            float mono  = (dryL + dryR) * 0.5f;
+
+            delayLineL.write (mono*params.panL + feedbackR);
+            delayLineR.write (mono*params.panR + feedbackL);
+
+            float wetL = delayLineL.read (delayInSamples);
+            float wetR = delayLineR.read (delayInSamples);
+
+            feedbackL = wetL * params.feedback;
+            feedbackL = lowCutFilter.processSample (0, feedbackL);
+            feedbackL = highCutFilter.processSample (0, feedbackL);
+            feedbackR = wetR * params.feedback;
+            feedbackR = lowCutFilter.processSample (1, feedbackR);
+            feedbackR = highCutFilter.processSample (1, feedbackR);
+
+            // multi-tap delay
+            // wetL += delayLine.popSample(0, delayInSamples*2.0f, false) * 0.7f;
+            // wetR += delayLine.popSample(0, delayInSamples*2.0f, false) * 0.7f;
+
+            float mixL = dryL + wetL * params.mix;
+            float mixR = dryR + wetR * params.mix;
+
+            float outL = mixL * params.gain;
+            float outR = mixR * params.gain;
+            outputDataL[sample] = outL;
+            outputDataR[sample] = outR;
+            maxL = std::max(maxL, std::abs(outL));
+            maxR = std::max(maxR, std::abs(outR));
+        }
+    } else {
+        for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+        {
+            params.smoothen();
+
+            float delayTime = params.tempoSync ? syncedTime : params.delayTime;
+            float delayInSamples = delayTime/1000.0f * sampleRate;
+
+            if (params.lowCut != lastLowCut) {
+                lowCutFilter.setCutoffFrequency (params.lowCut);
+                lastLowCut = params.lowCut;
+            }
+            if (params.highCut != lastHighCut) {
+                highCutFilter.setCutoffFrequency (params.highCut);
+                lastHighCut = params.highCut;
+            }
+
+            float dry = inputDataL[sample];
+            delayLineL.write (dry + feedbackL);
+
+            float wet = delayLineL.read (delayInSamples);
+            feedbackL = wet * params.feedback;
+            feedbackL = lowCutFilter.processSample (0, feedbackL);
+            feedbackL = highCutFilter.processSample (0, feedbackL);
+
+            float mix = dry + wet * params.mix;
+            outputDataL[sample] = mix * params.gain;
+            float outL = mix * params.gain;
+            outputDataL[sample] = outL;
+            maxL = std::max(maxL, std::abs(outL));
+        }
+    }
+    levelL.updateIfGreater (maxL);
+    levelR.updateIfGreater (maxR);
+    #if JUCE_DEBUG
+    protectYourEars (buffer);
+    #endif
 }
 
 //==============================================================================
@@ -168,14 +279,19 @@ void PluginProcessor::getStateInformation (juce::MemoryBlock& destData)
     // You should use this method to store your parameters in the memory block.
     // You could do that either as raw data, or use the XML or ValueTree classes
     // as intermediaries to make it easy to save and load complex data.
-    juce::ignoreUnused (destData);
+    copyXmlToBinary(*apvts.copyState().createXml(), destData);
+    // DBG(apvts.copyState().toXmlString ());
 }
 
 void PluginProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     // You should use this method to restore your parameters from this memory block,
     // whose contents will have been created by the getStateInformation() call.
-    juce::ignoreUnused (data, sizeInBytes);
+    std::unique_ptr<juce::XmlElement> xml(getXmlFromBinary(data, sizeInBytes));
+    if (xml != nullptr && xml->hasTagName(apvts.state.getType()))
+    {
+        apvts.replaceState (juce::ValueTree::fromXml (*xml));
+    }
 }
 
 //==============================================================================

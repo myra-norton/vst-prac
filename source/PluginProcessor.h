@@ -1,6 +1,11 @@
 #pragma once
 
+#include <juce_dsp/juce_dsp.h>
 #include <juce_audio_processors/juce_audio_processors.h>
+#include "Parameters.h"
+#include "Tempo.h"
+#include "DelayLine.h"
+#include "Measurement.h"
 
 #if (MSVC)
 #include "ipps.h"
@@ -38,6 +43,20 @@ public:
     void getStateInformation (juce::MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
 
+    juce::AudioProcessorValueTreeState apvts {
+        *this, nullptr, "Parameters", Parameters::createParameterLayout()
+    };
+    Parameters params;
+    Measurement levelL, levelR;
 private:
+    float feedbackL = 0.0f;
+    float feedbackR = 0.0f;
+    float lastLowCut = -1.0f;
+    float lastHighCut = -1.0f;
+    Tempo tempo;
+    DelayLine delayLineL, delayLineR;
+    // juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> delayLine;
+    juce::dsp::StateVariableTPTFilter<float> lowCutFilter;
+    juce::dsp::StateVariableTPTFilter<float> highCutFilter;
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginProcessor)
 };
