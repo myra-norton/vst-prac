@@ -42,6 +42,10 @@ private:
     juce::GroupComponent delayGroup, feedbackGroup, outputGroup;
 
     LevelMeter meter;
+    juce::ImageButton bypassButton;
+    juce::AudioProcessorValueTreeState::ButtonAttachment bypassAttachment {
+        processorRef.apvts, bypassParamID.getParamID(),bypassButton
+    };
 
     std::unique_ptr<melatonin::Inspector> inspector;
     juce::TextButton inspectButton { "Inspect the UI" };

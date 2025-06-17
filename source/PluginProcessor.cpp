@@ -95,6 +95,22 @@ void PluginProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     feedbackR = 0.0f;
     lastLowCut = -1.0f;
     lastHighCut = -1.0f;
+    /*
+    // For crossfading:
+    delayInSamples = 0.0f;
+    targetDelay = 0.0f;
+    xfade = 0.0f;
+    xfadeInc = static_cast<float>(1.0 / (0.05 * sampleRate));  // 50 ms
+    */
+
+    // For ducking:
+    delayInSamples = 0.0f;
+    targetDelay = 0.0f;
+    fade = 1.0f;
+    fadeTarget = 1.0f;
+    coeff = 1.0f - std::exp(-1.0f / (0.05f * float(sampleRate)));
+    wait = 0.0f;
+    waitInc = 1.0f / (0.3f * float(sampleRate));  // 300 ms
 
     juce::dsp::ProcessSpec spec;
     spec.sampleRate = sampleRate;
@@ -179,8 +195,35 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer, [[maybe_un
         {
             params.smoothen();
 
+            //float delayTime = params.tempoSync ? syncedTime : params.delayTime;
+            //float delayInSamples = delayTime / 1000.0f * sampleRate;
+
+            /*
+            // For crossfading:
+            if (xfade == 0.0f) {
+                float delayTime = params.tempoSync ? syncedTime : params.delayTime;
+                targetDelay = delayTime / 1000.0f * sampleRate;
+
+                if (delayInSamples == 0.0f) {  // first time
+                    delayInSamples = targetDelay;
+                } else if (targetDelay != delayInSamples) {  // start crossfade
+                    xfade = xfadeInc;
+                }
+            }
+            */
+
+            // For ducking:
             float delayTime = params.tempoSync ? syncedTime : params.delayTime;
-            float delayInSamples = delayTime/1000.0f * sampleRate;
+            float newTargetDelay = delayTime / 1000.0f * sampleRate;
+            if (newTargetDelay != targetDelay) {
+                targetDelay = newTargetDelay;
+                if (delayInSamples == 0.0f) {  // first time
+                    delayInSamples = targetDelay;
+                } else {
+                    wait = waitInc;     // start counter
+                    fadeTarget = 0.0f;  // fade out
+                }
+            }
 
             if (params.lowCut != lastLowCut) {
                 lowCutFilter.setCutoffFrequency (params.lowCut);
@@ -202,6 +245,42 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer, [[maybe_un
             float wetL = delayLineL.read (delayInSamples);
             float wetR = delayLineR.read (delayInSamples);
 
+            /*
+            // For crossfading:
+            if (xfade > 0.0f) {  // crossfading?
+                float newL = delayLineL.read(targetDelay);
+                float newR = delayLineR.read(targetDelay);
+
+                wetL = (1.0f - xfade) * wetL + xfade * newL;
+                wetR = (1.0f - xfade) * wetR + xfade * newR;
+
+                xfade += xfadeInc;
+                if (xfade >= 1.0f) {
+                    delayInSamples = targetDelay;
+                    xfade = 0.0f;
+                }
+            }
+            */
+
+            // For ducking:
+            fade += (fadeTarget - fade) * coeff;
+
+            wetL *= fade;
+            wetR *= fade;
+
+            if (wait > 0.0f) {
+                wait += waitInc;
+                if (wait >= 1.0f) {
+                    delayInSamples = targetDelay;
+                    wait = 0.0f;
+                    fadeTarget = 1.0f;  // fade in
+                }
+            }
+
+            // multi-tap delay
+            // wetL += delayLine.popSample(0, delayInSamples*2.0f, false) * 0.7f;
+            // wetR += delayLine.popSample(0, delayInSamples*2.0f, false) * 0.7f;
+
             feedbackL = wetL * params.feedback;
             feedbackL = lowCutFilter.processSample (0, feedbackL);
             feedbackL = highCutFilter.processSample (0, feedbackL);
@@ -209,15 +288,17 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer, [[maybe_un
             feedbackR = lowCutFilter.processSample (1, feedbackR);
             feedbackR = highCutFilter.processSample (1, feedbackR);
 
-            // multi-tap delay
-            // wetL += delayLine.popSample(0, delayInSamples*2.0f, false) * 0.7f;
-            // wetR += delayLine.popSample(0, delayInSamples*2.0f, false) * 0.7f;
 
             float mixL = dryL + wetL * params.mix;
             float mixR = dryR + wetR * params.mix;
 
             float outL = mixL * params.gain;
             float outR = mixR * params.gain;
+            if (params.bypassed)
+            {
+                outL = dryL;
+                outR = dryR;
+            }
             outputDataL[sample] = outL;
             outputDataR[sample] = outR;
             maxL = std::max(maxL, std::abs(outL));
@@ -228,8 +309,34 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer, [[maybe_un
         {
             params.smoothen();
 
+            //float delayTime = params.tempoSync ? syncedTime : params.delayTime;
+            //float delayInSamples = delayTime / 1000.0f * sampleRate;
+
+            /*
+            // for crossfading:
+            if (xfade == 0.0f) {
+                float delayTime = params.tempoSync ? syncedTime : params.delayTime;
+                targetDelay = delayTime / 1000.0f * sampleRate;
+
+                if (delayInSamples == 0.0f) {  // first time
+                    delayInSamples = targetDelay;
+                } else if (targetDelay != delayInSamples) {  // start crossfade
+                    xfade = xfadeInc;
+                }
+            }
+            */
+            // For ducking:
             float delayTime = params.tempoSync ? syncedTime : params.delayTime;
-            float delayInSamples = delayTime/1000.0f * sampleRate;
+            float newTargetDelay = delayTime / 1000.0f * sampleRate;
+            if (newTargetDelay != targetDelay) {
+                targetDelay = newTargetDelay;
+                if (delayInSamples == 0.0f) {  // first time
+                    delayInSamples = targetDelay;
+                } else {
+                    wait = waitInc;     // start counter
+                    fadeTarget = 0.0f;  // fade out
+                }
+            }
 
             if (params.lowCut != lastLowCut) {
                 lowCutFilter.setCutoffFrequency (params.lowCut);
@@ -243,7 +350,37 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer, [[maybe_un
             float dry = inputDataL[sample];
             delayLineL.write (dry + feedbackL);
 
-            float wet = delayLineL.read (delayInSamples);
+            float wet = delayLineL.read (delayInSamples);        /*
+        // For crossfading:
+        if (xfade > 0.0f) {  // crossfading?
+            float newL = delayLineL.read(targetDelay);
+            float newR = delayLineR.read(targetDelay);
+
+            wetL = (1.0f - xfade) * wetL + xfade * newL;
+            wetR = (1.0f - xfade) * wetR + xfade * newR;
+
+            xfade += xfadeInc;
+            if (xfade >= 1.0f) {
+                delayInSamples = targetDelay;
+                xfade = 0.0f;
+            }
+        }
+        */
+
+            // For ducking:
+            fade += (fadeTarget - fade) * coeff;
+
+            wet *= fade;
+
+            if (wait > 0.0f) {
+                wait += waitInc;
+                if (wait >= 1.0f) {
+                    delayInSamples = targetDelay;
+                    wait = 0.0f;
+                    fadeTarget = 1.0f;  // fade in
+                }
+            }
+
             feedbackL = wet * params.feedback;
             feedbackL = lowCutFilter.processSample (0, feedbackL);
             feedbackL = highCutFilter.processSample (0, feedbackL);
@@ -251,6 +388,10 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer, [[maybe_un
             float mix = dry + wet * params.mix;
             outputDataL[sample] = mix * params.gain;
             float outL = mix * params.gain;
+            if (params.bypassed)
+            {
+                outL = dry;
+            }
             outputDataL[sample] = outL;
             maxL = std::max(maxL, std::abs(outL));
         }
@@ -299,4 +440,9 @@ void PluginProcessor::setStateInformation (const void* data, int sizeInBytes)
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new PluginProcessor();
+}
+
+juce::AudioProcessorParameter* PluginProcessor::getBypassParameter() const
+{
+    return params.bypassParam;
 }

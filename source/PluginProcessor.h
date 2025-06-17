@@ -46,6 +46,8 @@ public:
     juce::AudioProcessorValueTreeState apvts {
         *this, nullptr, "Parameters", Parameters::createParameterLayout()
     };
+
+    juce::AudioProcessorParameter* getBypassParameter() const override;
     Parameters params;
     Measurement levelL, levelR;
 private:
@@ -53,6 +55,23 @@ private:
     float feedbackR = 0.0f;
     float lastLowCut = -1.0f;
     float lastHighCut = -1.0f;
+    /*
+    // For crossfading:
+    float delayInSamples = 0.0f;
+    float targetDelay = 0.0f;
+    float xfade = 0.0f;
+    float xfadeInc = 0.0f;
+    */
+
+    // For ducking:
+    float delayInSamples = 0.0f;
+    float targetDelay = 0.0f;
+    float fade = 0.0f;
+    float fadeTarget = 0.0f;
+    float coeff = 0.0f;
+    float wait = 0.0f;
+    float waitInc = 0.0f;
+
     Tempo tempo;
     DelayLine delayLineL, delayLineR;
     // juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> delayLine;
